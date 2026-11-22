@@ -1,0 +1,22 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Build
+        shell: cmd
+        run: cl /nologo /O2 /EHsc /LD /MT touch2main.cpp user32.lib shell32.lib /Fe:touch2main_${{ matrix.arch }}.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: touch2main_${{ matrix.arch }}
+          path: touch2main_${{ matrix.arch }}.dll
