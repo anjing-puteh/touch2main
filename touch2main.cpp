@@ -6,6 +6,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <wchar.h>
+#include <stdio.h>
+#include <stdarg.h>
+// v2: map touches from the digitizer's raw HIMETRIC position (immune to DPI scaling),
+//     take the main screen size from the real display mode (physical pixels),
+//     and write a small log next to the DLL (touch2main.log) for troubleshooting.
 #define WM_TRAY   (WM_APP + 1)
 #define ID_TOGGLE 1001
 #define ID_QUIT   1002
@@ -24,11 +29,52 @@ static BOOL CALLBACK EnumMon(HMONITOR m, HDC, LPRECT, LPARAM) {
     else if (IsRectEmpty(&g_touch)) g_touch = mi.rcMonitor;
     return TRUE;
 }
-static POINT MapPt(POINT p) {
-    LONG tw = g_touch.right - g_touch.left, th = g_touch.bottom - g_touch.top;
-    LONG mw = g_main.right - g_main.left,   mh = g_main.bottom - g_main.top;
-    POINT r = { g_main.left + MulDiv(p.x - g_touch.left, mw, tw), g_main.top + MulDiv(p.y - g_touch.top, mh, th) };
+static FILE* g_log;
+static int g_logTouches;
+static void Log(const char* fmt, ...) {
+    if (!g_log) return;
+    va_list a; va_start(a, fmt); vfprintf(g_log, fmt, a); va_end(a);
+    fputc('\n', g_log); fflush(g_log);
+}
+static void OpenLog() {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_hi, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return;
+    lstrcpyW(dot, L".log");
+    g_log = _wfopen(path, L"w");
+}
+static LONG Clamp(LONG v, LONG lo, LONG hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static POINT ScaleRect(double nx, double ny) {
+    if (nx < 0) nx = 0; if (nx > 1) nx = 1;
+    if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+    LONG mw = g_main.right - g_main.left, mh = g_main.bottom - g_main.top;
+    POINT r = { g_main.left + (LONG)(nx * (mw - 1) + 0.5), g_main.top + (LONG)(ny * (mh - 1) + 0.5) };
     return r;
+}
+// Map a touch on the touchscreen to a physical pixel on the main screen.
+static POINT MapPointer(const POINTER_INFO& pi) {
+    RECT dev, disp;
+    if (GetPointerDeviceRects(pi.sourceDevice, &dev, &disp) &&
+        dev.right > dev.left && dev.bottom > dev.top) {
+        // Raw digitizer position: unaffected by Windows display scaling.
+        double nx = double(pi.ptHimetricLocationRaw.x - dev.left) / double(dev.right - dev.left);
+        double ny = double(pi.ptHimetricLocationRaw.y - dev.top)  / double(dev.bottom - dev.top);
+        POINT r = ScaleRect(nx, ny);
+        if (g_logTouches < 5) {
+            g_logTouches++;
+            Log("touch raw=(%ld,%ld) dev=[%ld,%ld,%ld,%ld] disp=[%ld,%ld,%ld,%ld] px=(%ld,%ld) -> main=(%ld,%ld)",
+                pi.ptHimetricLocationRaw.x, pi.ptHimetricLocationRaw.y,
+                dev.left, dev.top, dev.right, dev.bottom, disp.left, disp.top, disp.right, disp.bottom,
+                pi.ptPixelLocation.x, pi.ptPixelLocation.y, r.x, r.y);
+        }
+        return r;
+    }
+    // Fallback: pixel position relative to the touchscreen monitor.
+    LONG tw = g_touch.right - g_touch.left, th = g_touch.bottom - g_touch.top;
+    POINT p = pi.ptPixelLocation;
+    return ScaleRect(double(Clamp(p.x - g_touch.left, 0, tw)) / tw, double(Clamp(p.y - g_touch.top, 0, th)) / th);
 }
 static void InjectAll() {
     POINTER_TOUCH_INFO arr[10]; UINT32 n = 0;
@@ -54,7 +100,7 @@ static void OnPointer(UINT msg, WPARAM wp) {
     POINTER_TOUCH_INFO& t = c.info;
     t.pointerInfo.pointerType = PT_TOUCH;
     t.pointerInfo.pointerId = slot;
-    t.pointerInfo.ptPixelLocation = MapPt(pi.ptPixelLocation);
+    t.pointerInfo.ptPixelLocation = MapPointer(pi);
     t.touchFlags = TOUCH_FLAG_NONE;
     t.touchMask = TOUCH_MASK_CONTACTAREA;
     POINT p = t.pointerInfo.ptPixelLocation;
@@ -100,10 +146,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 static DWORD WINAPI Worker(LPVOID) {
-    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    OpenLog();
+    DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    Log("touch2main v2 started, per-monitor DPI on thread: %s", prev ? "yes" : "NO");
     EnumDisplayMonitors(nullptr, nullptr, EnumMon, 0);
-    if (IsRectEmpty(&g_touch) || IsRectEmpty(&g_main)) return 0;
-    if (!InitializeTouchInjection(10, TOUCH_FEEDBACK_DEFAULT)) return 0;
+    // The primary monitor always starts at (0,0); take its true size from the display mode,
+    // which is in physical pixels no matter what DPI scaling is set.
+    DEVMODEW dm; ZeroMemory(&dm, sizeof(dm)); dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight) {
+        g_main.left = 0; g_main.top = 0;
+        g_main.right = (LONG)dm.dmPelsWidth; g_main.bottom = (LONG)dm.dmPelsHeight;
+    }
+    Log("main=[%ld,%ld,%ld,%ld] touch=[%ld,%ld,%ld,%ld]",
+        g_main.left, g_main.top, g_main.right, g_main.bottom,
+        g_touch.left, g_touch.top, g_touch.right, g_touch.bottom);
+    if (IsRectEmpty(&g_touch) || IsRectEmpty(&g_main)) { Log("no second monitor, exiting"); return 0; }
+    if (!InitializeTouchInjection(10, TOUCH_FEEDBACK_DEFAULT)) { Log("InitializeTouchInjection failed: %lu", GetLastError()); return 0; }
     WNDCLASSW wc; ZeroMemory(&wc, sizeof(wc)); wc.lpfnWndProc = WndProc; wc.hInstance = g_hi;
     wc.lpszClassName = L"touch2main_dll"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
